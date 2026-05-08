@@ -28,11 +28,17 @@ if not os.getenv("GOOGLE_API_KEY"):
 # from inside src/, or as an imported module from a web server.
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.dirname(_THIS_DIR)
+# --- Configuration ---
+# Model names live in environment variables so a deprecation is a one-line
+# config change, not a code change. Defaults match what was tested.
+
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.dirname(_THIS_DIR)
 PERSIST_DIR = os.path.join(_PROJECT_ROOT, "chroma_db")
 
-EMBEDDING_MODEL = "models/gemini-embedding-001"
-CHAT_MODEL = "gemini-2.5-flash-lite"
-TOP_K = 3
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "models/gemini-embedding-001")
+CHAT_MODEL = os.getenv("CHAT_MODEL", "gemini-2.5-flash-lite")
+TOP_K = int(os.getenv("TOP_K", "3"))
 
 
 # --- Singletons (lazy-built once, reused by every call) ---

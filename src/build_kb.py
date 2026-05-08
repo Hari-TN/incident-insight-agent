@@ -28,8 +28,9 @@ PERSIST_DIR = "./chroma_db"
 
 print("Loading embedding model (Gemini)...")
 # This is the model that converts text -> vector
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "models/gemini-embedding-001")
 embeddings = GoogleGenerativeAIEmbeddings(
-    model="models/gemini-embedding-001",  # Gemini's text embedding model (GA)
+    model=EMBEDDING_MODEL,
 )
 
 # Convert each incident into a LangChain Document.
