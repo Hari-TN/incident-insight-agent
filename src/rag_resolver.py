@@ -1,11 +1,10 @@
 """
 Full RAG pipeline: Retrieval-Augmented Generation for incident resolution.
 
-Flow:
-1. User submits a new incident description (the QUERY)
-2. RETRIEVAL: Find the top-K similar past incidents from ChromaDB
-3. AUGMENTATION: Inject those incidents as context into the LLM prompt
-4. GENERATION: Gemini drafts a resolution grounded in the retrieved history
+This module exposes:
+  - get_rag_chain()      : returns the composed LangChain pipeline
+  - get_retriever()      : returns the retriever for inspection
+  - resolve_incident()   : convenience function used by the API and CLI
 
 Run AFTER build_kb.py has seeded the knowledge base.
 """
@@ -24,43 +23,63 @@ load_dotenv()
 if not os.getenv("GOOGLE_API_KEY"):
     raise RuntimeError("GOOGLE_API_KEY not found. Did you create .env?")
 
-PERSIST_DIR = "./chroma_db"
+# Resolve the chroma_db path absolutely, relative to this file's location.
+# This way the retriever works whether you run from project root,
+# from inside src/, or as an imported module from a web server.
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.dirname(_THIS_DIR)
+PERSIST_DIR = os.path.join(_PROJECT_ROOT, "chroma_db")
 
-# --- 1. Set up the retriever (uses Phase 2's vector store) ---
-
-embeddings = GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-001")
-
-vector_store = Chroma(
-    persist_directory=PERSIST_DIR,
-    embedding_function=embeddings,
-    collection_name="incidents",
-)
-
-# .as_retriever() converts the vector store into a LangChain Retriever object
-# that accepts a query string and returns Documents. k=3 means "return top 3."
-retriever = vector_store.as_retriever(search_kwargs={"k": 3})
+EMBEDDING_MODEL = "models/gemini-embedding-001"
+CHAT_MODEL = "gemini-2.5-flash-lite"
+TOP_K = 3
 
 
-# --- 2. Set up the LLM ---
+# --- Singletons (lazy-built once, reused by every call) ---
 
-llm = ChatGoogleGenerativeAI(
-    model="gemini-2.5-flash-lite",
-    temperature=0,
-)
+_embeddings = None
+_vector_store = None
+_retriever = None
+_llm = None
+_chain = None
 
 
-# --- 3. Build the augmented prompt ---
+def _format_docs(docs):
+    """Turn a list of LangChain Documents into a string for the prompt."""
+    formatted = []
+    for i, doc in enumerate(docs, start=1):
+        formatted.append(
+            f"[{i}] {doc.metadata.get('id')} — {doc.metadata.get('title')}\n"
+            f"    {doc.page_content}"
+        )
+    return "\n\n".join(formatted)
 
-# This prompt template has TWO variables:
-#   {context}  — the retrieved past incidents (filled in by the retriever)
-#   {question} — the new incident the user is asking about
-#
-# Notice how the prompt instructs the LLM to USE the past incidents.
-# That's the whole "augmentation" idea: ground the model in your data,
-# not its general training knowledge.
-RAG_PROMPT_TEMPLATE = """You are a senior site reliability engineer helping a team
-resolve a production incident. You have access to a small library of past incidents
-that were resolved by your team.
+
+def get_retriever():
+    """Return a LangChain retriever backed by the persisted ChromaDB store."""
+    global _embeddings, _vector_store, _retriever
+    if _retriever is None:
+        _embeddings = GoogleGenerativeAIEmbeddings(model=EMBEDDING_MODEL)
+        _vector_store = Chroma(
+            persist_directory=PERSIST_DIR,
+            embedding_function=_embeddings,
+            collection_name="incidents",
+        )
+        _retriever = _vector_store.as_retriever(search_kwargs={"k": TOP_K})
+    return _retriever
+
+
+def get_rag_chain():
+    """Return the composed RAG chain (retriever | prompt | LLM | parser)."""
+    global _llm, _chain
+    if _chain is None:
+        retriever = get_retriever()
+        _llm = ChatGoogleGenerativeAI(model=CHAT_MODEL, temperature=0)
+
+        prompt = ChatPromptTemplate.from_template(
+            """You are a senior site reliability engineer helping a team
+resolve a production incident. You have access to a small library of past
+incidents that were resolved by your team.
 
 Use the past incidents below to suggest a concrete, actionable first response.
 If the past incidents don't seem relevant, say so honestly rather than inventing.
@@ -74,68 +93,58 @@ NEW INCIDENT:
 {question}
 
 YOUR RESPONSE (be concise and technical, 3-5 sentences max):"""
-
-prompt = ChatPromptTemplate.from_template(RAG_PROMPT_TEMPLATE)
-
-
-# --- 4. Helper: format retrieved docs into a single string ---
-
-def format_docs(docs):
-    """Turn a list of LangChain Documents into a string for the prompt."""
-    formatted = []
-    for i, doc in enumerate(docs, start=1):
-        formatted.append(
-            f"[{i}] {doc.metadata.get('id')} — {doc.metadata.get('title')}\n"
-            f"    {doc.page_content}"
         )
-    return "\n\n".join(formatted)
+
+        _chain = (
+            {"context": retriever | _format_docs, "question": RunnablePassthrough()}
+            | prompt
+            | _llm
+            | StrOutputParser()
+        )
+    return _chain
 
 
-# --- 5. The RAG chain itself ---
-#
-# This is LangChain Expression Language (LCEL). Read it like a pipeline:
-#
-#   {"context": retriever | format_docs, "question": RunnablePassthrough()}
-#       |  prompt
-#       |  llm
-#       |  StrOutputParser()
-#
-# Step by step, when you invoke this chain with a question string:
-#   - "context" key: the question goes to the retriever, which returns docs,
-#     which then go to format_docs() to become a single string.
-#   - "question" key: the question is passed through unchanged.
-#   - The dict (context + question) feeds into the prompt template.
-#   - The filled prompt feeds into the LLM.
-#   - The LLM's response goes through StrOutputParser to extract plain text.
-#
-# This `|` chaining is one of the most-asked-about features in interviews.
-rag_chain = (
-    {"context": retriever | format_docs, "question": RunnablePassthrough()}
-    | prompt
-    | llm
-    | StrOutputParser()
-)
+def resolve_incident(query: str) -> dict:
+    """
+    Run the full RAG pipeline for a single query.
+    Returns both the LLM resolution and the retrieved context (for transparency).
+    """
+    retriever = get_retriever()
+    chain = get_rag_chain()
+
+    retrieved_docs = retriever.invoke(query)
+    resolution = chain.invoke(query)
+
+    return {
+        "query": query,
+        "resolution": resolution,
+        "retrieved_incidents": [
+            {
+                "id": doc.metadata.get("id"),
+                "title": doc.metadata.get("title"),
+            }
+            for doc in retrieved_docs
+        ],
+    }
 
 
-# --- 6. Run it ---
+# --- CLI entry point (so the script still works standalone) ---
 
-if len(sys.argv) > 1:
-    query = " ".join(sys.argv[1:])
-else:
-    query = "Payment gateway is throwing 500s and customers can't check out"
+if __name__ == "__main__":
+    if len(sys.argv) > 1:
+        query = " ".join(sys.argv[1:])
+    else:
+        query = "Payment gateway is throwing 500s and customers can't check out"
 
-print("=" * 70)
-print(f"NEW INCIDENT: {query}")
-print("=" * 70)
+    result = resolve_incident(query)
 
-# First, show what got retrieved (so the RAG is transparent, not magic)
-retrieved_docs = retriever.invoke(query)
-print("\nRETRIEVED CONTEXT:")
-for i, doc in enumerate(retrieved_docs, start=1):
-    print(f"  [{i}] {doc.metadata.get('id')} — {doc.metadata.get('title')}")
-
-print("\nGENERATING RESOLUTION SUGGESTION...\n")
-print("-" * 70)
-response = rag_chain.invoke(query)
-print(response)
-print("-" * 70)
+    print("=" * 70)
+    print(f"NEW INCIDENT: {result['query']}")
+    print("=" * 70)
+    print("\nRETRIEVED CONTEXT:")
+    for i, inc in enumerate(result["retrieved_incidents"], start=1):
+        print(f"  [{i}] {inc['id']} — {inc['title']}")
+    print("\nGENERATING RESOLUTION SUGGESTION...\n")
+    print("-" * 70)
+    print(result["resolution"])
+    print("-" * 70)
